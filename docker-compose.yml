@@ -1,0 +1,27 @@
+# Docker Compose for WhatsApp Prometheus Exporter (Standalone)
+# This file can be used to run the exporter independently from the main stack
+
+services:
+  prometheus-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wa_llm_prometheus_exporter
+    ports:
+      - "9100:9100"
+    environment:
+      - PORT=9100
+      - LOG_LEVEL=INFO
+      # Database connection - adjust these values
+      - DB_URI=postgresql+asyncpg://user:password@host.docker.internal:5432/postgres
+      # WhatsApp API connection - adjust these values  
+      - WHATSAPP_HOST=http://host.docker.internal:3000
+      - WHATSAPP_BASIC_AUTH_USER=${WHATSAPP_BASIC_AUTH_USER:-}
+      - WHATSAPP_BASIC_AUTH_PASSWORD=${WHATSAPP_BASIC_AUTH_PASSWORD:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:9100/health', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
