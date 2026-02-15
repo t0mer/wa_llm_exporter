@@ -41,7 +41,7 @@ DB_URI = os.getenv("DB_URI", "postgresql+asyncpg://user:password@localhost:5432/
 WHATSAPP_HOST = os.getenv("WHATSAPP_HOST", "http://localhost:3000")
 WHATSAPP_BASIC_AUTH_USER = os.getenv("WHATSAPP_BASIC_AUTH_USER", "admin")
 WHATSAPP_BASIC_AUTH_PASSWORD = os.getenv("WHATSAPP_BASIC_AUTH_PASSWORD", "admin")
-PORT = int(os.getenv("PORT", "9100"))
+PORT = 9100
 
 # ============================================================================
 # Prometheus Metrics Definitions
