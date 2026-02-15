@@ -1,0 +1,15 @@
+# WhatsApp Prometheus Exporter Dependencies
+
+# Web framework
+starlette>=0.40.0
+uvicorn>=0.30.0
+
+# Prometheus metrics
+prometheus-client>=0.20.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29.0
+
+# HTTP client
+httpx>=0.27.0
