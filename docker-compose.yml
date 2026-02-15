@@ -3,14 +3,11 @@
 
 services:
   prometheus-exporter:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: wa_llm_prometheus_exporter
+    image: techblog/wa-llm-exporter
+    container_name: wa_llm_exporter
     ports:
       - "9100:9100"
     environment:
-      - PORT=9100
       - LOG_LEVEL=INFO
       # Database connection - adjust these values
       - DB_URI=postgresql+asyncpg://user:password@host.docker.internal:5432/postgres
