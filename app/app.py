@@ -38,14 +38,27 @@ logger = logging.getLogger(__name__)
 
 # Configuration from environment
 DB_URI = os.getenv("DB_URI", "postgresql+asyncpg://user:password@localhost:5432/postgres")
+
+
+def choose_backend(backend: str, api_key: str) -> str:
+    """Return "openwa" or "gowa" (explicit setting wins; auto = openwa iff an API key is set)."""
+    value = (backend or "auto").strip().lower()
+    if value in ("openwa", "gowa"):
+        return value
+    return "openwa" if api_key else "gowa"
+
+
+def default_whatsapp_host(backend: str, api_key: str, host: str) -> str:
+    """WHATSAPP_HOST if set, else the default port of the resolved backend."""
+    if host:
+        return host
+    return "http://localhost:2785" if choose_backend(backend, api_key) == "openwa" else "http://localhost:3000"
+
+
 WHATSAPP_BACKEND = os.getenv("WHATSAPP_BACKEND", "auto")  # auto | openwa | gowa
 OPENWA_API_KEY = os.getenv("OPENWA_API_KEY", "")
 OPENWA_SESSION_ID = os.getenv("OPENWA_SESSION_ID", "")
-# Default host depends on the backend: OpenWA listens on 2785, go-whatsapp on 3000.
-WHATSAPP_HOST = os.getenv("WHATSAPP_HOST") or (
-    "http://localhost:2785" if (os.getenv("OPENWA_API_KEY") or os.getenv("WHATSAPP_BACKEND", "").lower() == "openwa")
-    else "http://localhost:3000"
-)
+WHATSAPP_HOST = default_whatsapp_host(WHATSAPP_BACKEND, OPENWA_API_KEY, os.getenv("WHATSAPP_HOST", ""))
 WHATSAPP_BASIC_AUTH_USER = os.getenv("WHATSAPP_BASIC_AUTH_USER", "admin")
 WHATSAPP_BASIC_AUTH_PASSWORD = os.getenv("WHATSAPP_BASIC_AUTH_PASSWORD", "admin")
 
@@ -247,19 +260,41 @@ async def get_db_session() -> AsyncSession:
 # Metrics Collection Functions
 # ============================================================================
 
+# Known "[[Attached X]]" types; anything else (user-controlled text) becomes "other".
+KNOWN_MESSAGE_TYPES = frozenset({
+    "text", "image", "video", "audio", "voice", "document", "sticker", "gif",
+    "contact", "location", "poll", "list", "order",
+})
+
 # Test hook: an httpx transport (e.g. httpx.MockTransport) used for API calls.
 HTTP_TRANSPORT: httpx.AsyncBaseTransport | None = None
 
 OPENWA_GROUPS_PAGE_SIZE = 100
-OPENWA_GROUPS_MAX_PAGES = 200
+OPENWA_GROUPS_MAX_PAGES = 50
 
 
 def resolve_backend() -> str:
-    """Return "openwa" or "gowa" from WHATSAPP_BACKEND (auto = openwa iff API key set)."""
-    backend = (WHATSAPP_BACKEND or "auto").strip().lower()
-    if backend in ("openwa", "gowa"):
-        return backend
-    return "openwa" if OPENWA_API_KEY else "gowa"
+    """Return "openwa" or "gowa" from WHATSAPP_BACKEND / OPENWA_API_KEY."""
+    return choose_backend(WHATSAPP_BACKEND, OPENWA_API_KEY)
+
+
+def log_backend_choice():
+    """Log which WhatsApp backend is used (never the API key)."""
+    logger.info(f"WhatsApp backend: {resolve_backend()} (host {WHATSAPP_HOST})")
+
+
+def _redact(text_: str) -> str:
+    if OPENWA_API_KEY:
+        return text_.replace(OPENWA_API_KEY, "***")
+    return text_
+
+
+def _reset_openwa_state(clear_status: bool = True):
+    """Drop stale OpenWA-derived series after a non-success scrape."""
+    if clear_status:
+        whatsapp_session_status.clear()
+        whatsapp_device_info.info({"name": "", "device": ""})
+    whatsapp_api_groups.set(float("nan"))
 
 
 def _unwrap(payload: Any) -> Any:
@@ -298,10 +333,52 @@ async def collect_whatsapp_metrics():
         logger.error(f"WhatsApp metrics collection failed: {type(e).__name__}")
 
 
+def _fail_openwa(error_type: str):
+    whatsapp_connection_status.set(0)
+    whatsapp_devices_total.set(0)
+    _reset_openwa_state()
+    scrape_errors_total.labels(error_type=error_type).inc()
+
+
+async def _list_openwa_groups(client: httpx.AsyncClient, session_path: str) -> int:
+    """Count groups by paging, deduplicating ids; tolerant of servers that clamp the limit."""
+    seen: set[str] = set()
+    offset = 0
+    for _ in range(OPENWA_GROUPS_MAX_PAGES):
+        start = time.time()
+        resp = await client.get(
+            f"{session_path}/groups",
+            params={"limit": OPENWA_GROUPS_PAGE_SIZE, "offset": offset},
+        )
+        whatsapp_api_latency_seconds.labels(
+            endpoint="/api/sessions/{id}/groups"
+        ).observe(time.time() - start)
+        if resp.status_code != 200:
+            raise RuntimeError(f"groups status {resp.status_code}")
+        items = _extract_list(resp.json())
+        added = 0
+        for item in items:
+            key = None
+            if isinstance(item, dict):
+                for field in ("id", "groupId", "jid", "chatId"):
+                    if item.get(field):
+                        key = str(item[field])
+                        break
+            key = key or repr(item)
+            if key not in seen:
+                seen.add(key)
+                added += 1
+        if not items or added == 0:
+            break
+        offset += len(items)
+    else:
+        logger.warning(f"OpenWA group listing hit the {OPENWA_GROUPS_MAX_PAGES} page cap")
+    return len(seen)
+
+
 async def _collect_openwa():
     if not OPENWA_SESSION_ID:
-        whatsapp_connection_status.set(0)
-        scrape_errors_total.labels(error_type="whatsapp_config_error").inc()
+        _fail_openwa("whatsapp_config_error")
         logger.warning("OPENWA_SESSION_ID is not set; cannot query OpenWA")
         return
 
@@ -315,16 +392,12 @@ async def _collect_openwa():
             response = await client.get(session_path)
             whatsapp_api_latency_seconds.labels(endpoint="/api/sessions/{id}").observe(time.time() - start)
         except Exception as e:
-            whatsapp_connection_status.set(0)
-            whatsapp_devices_total.set(0)
-            scrape_errors_total.labels(error_type="whatsapp_connection_error").inc()
+            _fail_openwa("whatsapp_connection_error")
             logger.error(f"Failed to connect to OpenWA: {type(e).__name__}")
             return
 
         if response.status_code != 200:
-            whatsapp_connection_status.set(0)
-            whatsapp_devices_total.set(0)
-            scrape_errors_total.labels(error_type="whatsapp_api_error").inc()
+            _fail_openwa("whatsapp_api_error")
             logger.warning(f"OpenWA session endpoint returned status {response.status_code}")
             return
 
@@ -333,8 +406,7 @@ async def _collect_openwa():
             if not isinstance(body, dict):
                 raise ValueError("unexpected session payload")
         except ValueError:
-            whatsapp_connection_status.set(0)
-            scrape_errors_total.labels(error_type="whatsapp_api_error").inc()
+            _fail_openwa("whatsapp_api_error")
             logger.warning("OpenWA session endpoint returned an unparseable body")
             return
 
@@ -345,36 +417,23 @@ async def _collect_openwa():
         whatsapp_session_status.clear()
         whatsapp_session_status.labels(status=status).set(1)
 
-        phone = "".join(ch for ch in str(body.get("phone") or "") if ch.isdigit())
+        phone_raw = str(body.get("phone") or "").split("@")[0].split(":")[0]
+        phone = "".join(ch for ch in phone_raw if ch.isdigit())
         whatsapp_device_info.info({
             "name": str(body.get("pushName") or ""),
             "device": f"{phone}@s.whatsapp.net" if phone else "",
         })
 
         if not ready:
+            _reset_openwa_state(clear_status=False)
             return
 
         try:
-            total = 0
-            for page in range(OPENWA_GROUPS_MAX_PAGES):
-                start = time.time()
-                resp = await client.get(
-                    f"{session_path}/groups",
-                    params={"limit": OPENWA_GROUPS_PAGE_SIZE, "offset": page * OPENWA_GROUPS_PAGE_SIZE},
-                )
-                whatsapp_api_latency_seconds.labels(
-                    endpoint="/api/sessions/{id}/groups"
-                ).observe(time.time() - start)
-                if resp.status_code != 200:
-                    raise RuntimeError(f"groups status {resp.status_code}")
-                items = _extract_list(resp.json())
-                total += len(items)
-                if len(items) < OPENWA_GROUPS_PAGE_SIZE:
-                    break
-            whatsapp_api_groups.set(total)
+            whatsapp_api_groups.set(await _list_openwa_groups(client, session_path))
         except Exception as e:
+            _reset_openwa_state(clear_status=False)
             scrape_errors_total.labels(error_type="whatsapp_groups_error").inc()
-            logger.warning(f"Failed to list groups from OpenWA: {type(e).__name__}: {e}")
+            logger.warning(f"Failed to list groups from OpenWA: {type(e).__name__}: {_redact(str(e))}")
 
 
 async def _collect_gowa():
