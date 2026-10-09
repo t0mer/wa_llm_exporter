@@ -78,7 +78,7 @@ flowchart LR
 | `sender` | `jid`, `push_name` |
 | `reaction`, `opt_out`, `kbtopic`, `kb_topic_message` | row count only |
 
-Every query runs in its own savepoint. If one fails (for example a table is missing), only that
+The `display_name` column (absent on original wa_llm schemas) is detected once via `information_schema` and re-checked after a failure of the group query. Every query runs in its own savepoint. If one fails (for example a table is missing), only that
 metric is skipped (a gauge keeps its previous value; a missing table simply has no
 `whatsapp_db_table_rows` sample), the failure is logged and counted as
 `whatsapp_exporter_scrape_errors_total{error_type="query:<name>"}`, and all later queries still run.
@@ -95,7 +95,7 @@ metric is skipped (a gauge keeps its previous value; a missing table simply has 
 
 With OpenWA, `whatsapp_connection_status` is `1` only when the session status is `ready`;
 `whatsapp_session_status{status="..."}` shows the exact status (for example `qr` or `disconnected`).
-Responses are accepted both bare and wrapped as `{"data": {...}}`, and group lists under `data`,
+Group listing is paged (100 per page, at most 200 pages) and de-duplicated by id, so servers that clamp the page size or ignore the offset still terminate. Responses are accepted both bare and wrapped as `{"data": {...}}`, and group lists under `data`,
 `groups`, `items`, `results` or as a bare list. `OPENWA_SESSION_ID` and `OPENWA_API_KEY` must match
 the values in the bot's own `.env`. The API key is sent only as a header and is never logged.
 

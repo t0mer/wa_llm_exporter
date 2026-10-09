@@ -24,6 +24,43 @@ async def test_spoofed_attach_types_bucket_to_other(db):
     assert types == {"other": 50, "image": 1, "text": 1}
 
 
+def group_errors():
+    return sample(
+        "whatsapp_exporter_scrape_errors_total", {"error_type": "query:messages_per_group"}
+    ) or 0
+
+
+async def test_no_error_noise_without_display_name_column(db):
+    await db('INSERT INTO "group" (group_jid, group_name) VALUES (\'g1@g.us\', \'Old\')')
+    await db('ALTER TABLE "group" DROP COLUMN display_name')
+    before = group_errors()
+    for _ in range(2):
+        await exporter.collect_database_metrics()
+    assert group_errors() == before
+    assert sample("whatsapp_messages_per_group", {"group_jid": "g1@g.us", "group_name": "Old"}) == 0
+
+
+async def test_no_error_noise_with_display_name_column(db):
+    await db("""INSERT INTO "group" (group_jid, group_name, display_name) VALUES ('g1@g.us', 'Old', 'New')""")
+    before = group_errors()
+    for _ in range(2):
+        await exporter.collect_database_metrics()
+    assert group_errors() == before
+    assert sample("whatsapp_messages_per_group", {"group_jid": "g1@g.us", "group_name": "New"}) == 0
+
+
+async def test_column_check_rechecked_after_failure(db):
+    await db("""INSERT INTO "group" (group_jid, group_name, display_name) VALUES ('g1@g.us', 'Old', 'New')""")
+    await exporter.collect_database_metrics()  # caches "column exists"
+    await db('ALTER TABLE "group" DROP COLUMN display_name')
+    before = group_errors()
+    await exporter.collect_database_metrics()  # chosen query fails, counted once
+    assert group_errors() == before + 1
+    await exporter.collect_database_metrics()  # re-detected, works
+    assert group_errors() == before + 1
+    assert sample("whatsapp_messages_per_group", {"group_jid": "g1@g.us", "group_name": "Old"}) == 0
+
+
 async def test_group_query_falls_back_without_display_name(db):
     await db('INSERT INTO "group" (group_jid, group_name) VALUES (\'g1@g.us\', \'Old name\')')
     await db("INSERT INTO message (message_id, timestamp, group_jid) VALUES ('m', now(), 'g1@g.us')")

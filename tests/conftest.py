@@ -42,6 +42,7 @@ async def db(monkeypatch):
             await conn.execute(text(stmt))
     factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(exporter, "async_session_factory", factory)
+    monkeypatch.setattr(exporter, "_group_has_display_name", None)
 
     async def run(sql, **params):
         async with engine.begin() as conn:

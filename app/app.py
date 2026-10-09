@@ -523,6 +523,25 @@ async def _scalar_into(session: AsyncSession, name: str, gauge: Gauge, sql: str,
         gauge.set((rows[0][0] if rows else 0) or 0)
 
 
+# Whether "group".display_name exists (absent on original wa_llm schemas).
+# None = unknown; detected once and re-checked after the group query fails.
+_group_has_display_name: bool | None = None
+
+
+async def _has_display_name(session: AsyncSession) -> bool:
+    global _group_has_display_name
+    if _group_has_display_name is None:
+        rows = await _query(session, "group_columns", """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'group'
+              AND column_name = 'display_name'
+        """)
+        if rows is None:
+            return True  # undetermined: try the full query and let it report
+        _group_has_display_name = bool(rows)
+    return _group_has_display_name
+
+
 async def collect_database_metrics():
     """Collect database metrics."""
     try:
@@ -575,9 +594,12 @@ async def collect_database_metrics():
             for name, gauge, sql, params in scalars:
                 await _scalar_into(session, name, gauge, sql, params)
 
-            # Messages per group (top 50). display_name is missing on original wa_llm schemas,
-            # so fall back to a query without it.
-            group_sql = """
+            # Messages per group (top 50). display_name is missing on original wa_llm schemas.
+            global _group_has_display_name
+            with_display = await _has_display_name(session)
+            rows = await _query(
+                session, "messages_per_group",
+                """
                 SELECT g.group_jid,
                        COALESCE({label}) AS label,
                        COUNT(m.message_id) as msg_count
@@ -586,19 +608,16 @@ async def collect_database_metrics():
                 GROUP BY g.group_jid{extra}, g.group_name
                 ORDER BY msg_count DESC
                 LIMIT 50
-            """
-            rows = await _query(
-                session, "messages_per_group",
-                group_sql.format(
-                    label="NULLIF(g.display_name, ''), NULLIF(g.group_name, ''), g.group_jid",
-                    extra=", g.display_name",
+                """.format(
+                    label=(
+                        "NULLIF(g.display_name, ''), NULLIF(g.group_name, ''), g.group_jid"
+                        if with_display else "NULLIF(g.group_name, ''), g.group_jid"
+                    ),
+                    extra=", g.display_name" if with_display else "",
                 ),
             )
             if rows is None:
-                rows = await _query(
-                    session, "messages_per_group_no_display_name",
-                    group_sql.format(label="NULLIF(g.group_name, ''), g.group_jid", extra=""),
-                )
+                _group_has_display_name = None  # re-detect the schema next scrape
             if rows is not None:
                 messages_per_group.clear()
                 for row in rows:
