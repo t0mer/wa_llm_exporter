@@ -11,10 +11,21 @@ services:
       - LOG_LEVEL=INFO
       # Database connection - adjust these values
       - DB_URI=postgresql+asyncpg://user:password@host.docker.internal:5432/postgres
-      # WhatsApp API connection - adjust these values  
-      - WHATSAPP_HOST=http://host.docker.internal:3000
+      # WhatsApp API connection. OpenWA listens on 2785 (gowa: 3000).
+      # OPENWA_API_KEY / OPENWA_SESSION_ID must match the bot's .env.
+      - WHATSAPP_BACKEND=${WHATSAPP_BACKEND:-auto}   # auto | openwa | gowa
+      - WHATSAPP_HOST=${WHATSAPP_HOST:-http://host.docker.internal:2785}
+      - OPENWA_API_KEY=${OPENWA_API_KEY:-}
+      - OPENWA_SESSION_ID=${OPENWA_SESSION_ID:-}
+      # Comma-separated bot JIDs (phone and/or @lid) to exclude from sender metrics
+      - BOT_JIDS=${BOT_JIDS:-}
+      # gowa backend only
       - WHATSAPP_BASIC_AUTH_USER=${WHATSAPP_BASIC_AUTH_USER:-}
       - WHATSAPP_BASIC_AUTH_PASSWORD=${WHATSAPP_BASIC_AUTH_PASSWORD:-}
+    # On Linux, host.docker.internal needs this; or join the bot's compose network instead
+    # (external network <bot-project>_default, DB host "postgres", WHATSAPP_HOST http://whatsapp:2785).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:9100/health', timeout=5).raise_for_status()"]
