@@ -423,6 +423,31 @@ async def _collect_gowa():
                 logger.warning(f"Failed to get groups from WhatsApp API: {e}")
 
 
+async def _query(session: AsyncSession, name: str, sql: str, params: dict | None = None):
+    """Run one query inside a savepoint so a failure cannot poison later queries.
+
+    Returns the rows, or None on failure (counted as scrape_errors_total{error_type="query:<name>"}).
+    """
+    start = time.time()
+    try:
+        async with session.begin_nested():
+            result = await session.execute(text(sql), params or {})
+            rows = result.all()
+        return rows
+    except Exception as e:
+        scrape_errors_total.labels(error_type=f"query:{name}").inc()
+        logger.warning(f"Query {name} failed: {type(e).__name__}: {e}")
+        return None
+    finally:
+        db_query_latency_seconds.labels(query_type=name).observe(time.time() - start)
+
+
+async def _scalar_into(session: AsyncSession, name: str, gauge: Gauge, sql: str, params: dict | None = None):
+    rows = await _query(session, name, sql, params)
+    if rows is not None:
+        gauge.set((rows[0][0] if rows else 0) or 0)
+
+
 async def collect_database_metrics():
     """Collect database metrics."""
     try:
@@ -439,172 +464,79 @@ async def collect_database_metrics():
             last_24h = now - timedelta(hours=24)
             last_hour = now - timedelta(hours=1)
 
-            # Messages total
-            start = time.time()
-            result = await session.execute(text("SELECT COUNT(*) FROM message"))
-            total_messages = result.scalar() or 0
-            db_query_latency_seconds.labels(query_type="messages_total").observe(time.time() - start)
-            messages_total.set(total_messages)
-
-            # Messages today
-            start = time.time()
-            result = await session.execute(
-                text("SELECT COUNT(*) FROM message WHERE timestamp >= :ts"),
-                {"ts": today_start}
-            )
-            messages_today.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="messages_today").observe(time.time() - start)
-
-            # Messages last 24h
-            start = time.time()
-            result = await session.execute(
-                text("SELECT COUNT(*) FROM message WHERE timestamp >= :ts"),
-                {"ts": last_24h}
-            )
-            messages_last_24h.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="messages_last_24h").observe(time.time() - start)
-
-            # Messages last hour
-            start = time.time()
-            result = await session.execute(
-                text("SELECT COUNT(*) FROM message WHERE timestamp >= :ts"),
-                {"ts": last_hour}
-            )
-            messages_last_hour.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="messages_last_hour").observe(time.time() - start)
-
-            # Direct vs Group messages
-            start = time.time()
-            result = await session.execute(
-                text("SELECT COUNT(*) FROM message WHERE group_jid IS NULL")
-            )
-            messages_direct_total.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="messages_direct").observe(time.time() - start)
-
-            start = time.time()
-            result = await session.execute(
-                text("SELECT COUNT(*) FROM message WHERE group_jid IS NOT NULL")
-            )
-            messages_group_total.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="messages_group").observe(time.time() - start)
-
-            # Messages with media
-            start = time.time()
-            result = await session.execute(
-                text("SELECT COUNT(*) FROM message WHERE media_url IS NOT NULL")
-            )
-            messages_with_media.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="messages_with_media").observe(time.time() - start)
+            scalars = [
+                ("messages_total", messages_total, "SELECT COUNT(*) FROM message", None),
+                ("messages_today", messages_today,
+                 "SELECT COUNT(*) FROM message WHERE timestamp >= :ts", {"ts": today_start}),
+                ("messages_last_24h", messages_last_24h,
+                 "SELECT COUNT(*) FROM message WHERE timestamp >= :ts", {"ts": last_24h}),
+                ("messages_last_hour", messages_last_hour,
+                 "SELECT COUNT(*) FROM message WHERE timestamp >= :ts", {"ts": last_hour}),
+                ("messages_direct", messages_direct_total,
+                 "SELECT COUNT(*) FROM message WHERE group_jid IS NULL", None),
+                ("messages_group", messages_group_total,
+                 "SELECT COUNT(*) FROM message WHERE group_jid IS NOT NULL", None),
+                ("messages_with_media", messages_with_media,
+                 "SELECT COUNT(*) FROM message WHERE media_url IS NOT NULL", None),
+                ("groups_total", groups_total, 'SELECT COUNT(*) FROM "group"', None),
+                ("groups_managed", groups_managed,
+                 'SELECT COUNT(*) FROM "group" WHERE managed = true', None),
+                ("groups_spam_notify", groups_with_spam_notification,
+                 'SELECT COUNT(*) FROM "group" WHERE notify_on_spam = true', None),
+                ("groups_community", groups_with_community,
+                 'SELECT COUNT(*) FROM "group" WHERE community_keys IS NOT NULL', None),
+                ("senders_total", senders_total, "SELECT COUNT(*) FROM sender", None),
+                ("senders_active_24h", senders_active_24h,
+                 "SELECT COUNT(DISTINCT sender_jid) FROM message WHERE timestamp >= :ts",
+                 {"ts": last_24h}),
+                ("reactions_total", reactions_total, "SELECT COUNT(*) FROM reaction", None),
+                ("optouts_total", optouts_total, "SELECT COUNT(*) FROM opt_out", None),
+                ("kb_topics_total", kb_topics_total, "SELECT COUNT(*) FROM kbtopic", None),
+            ]
+            for name, gauge, sql, params in scalars:
+                await _scalar_into(session, name, gauge, sql, params)
 
             # Messages per group (top 50)
-            start = time.time()
-            result = await session.execute(text("""
+            rows = await _query(session, "messages_per_group", """
                 SELECT g.group_jid, g.group_name, COUNT(m.message_id) as msg_count
                 FROM "group" g
                 LEFT JOIN message m ON m.group_jid = g.group_jid
                 GROUP BY g.group_jid, g.group_name
                 ORDER BY msg_count DESC
                 LIMIT 50
-            """))
-            for row in result:
-                group_jid = row[0] or "unknown"
-                group_name = row[1] or "unnamed"
-                msg_count = row[2] or 0
-                # Clean up group name for metric label
-                safe_name = group_name.replace('"', '').replace("'", "")[:50]
-                messages_per_group.labels(group_jid=group_jid, group_name=safe_name).set(msg_count)
-            db_query_latency_seconds.labels(query_type="messages_per_group").observe(time.time() - start)
-
-            # Groups metrics
-            start = time.time()
-            result = await session.execute(text('SELECT COUNT(*) FROM "group"'))
-            groups_total.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="groups_total").observe(time.time() - start)
-
-            start = time.time()
-            result = await session.execute(text('SELECT COUNT(*) FROM "group" WHERE managed = true'))
-            groups_managed.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="groups_managed").observe(time.time() - start)
-
-            start = time.time()
-            result = await session.execute(text('SELECT COUNT(*) FROM "group" WHERE notify_on_spam = true'))
-            groups_with_spam_notification.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="groups_spam_notify").observe(time.time() - start)
-
-            start = time.time()
-            result = await session.execute(text('SELECT COUNT(*) FROM "group" WHERE community_keys IS NOT NULL'))
-            groups_with_community.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="groups_community").observe(time.time() - start)
-
-            # Senders metrics
-            start = time.time()
-            result = await session.execute(text("SELECT COUNT(*) FROM sender"))
-            senders_total.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="senders_total").observe(time.time() - start)
-
-            # Active senders in last 24h
-            start = time.time()
-            result = await session.execute(text("""
-                SELECT COUNT(DISTINCT sender_jid) FROM message WHERE timestamp >= :ts
-            """), {"ts": last_24h})
-            senders_active_24h.set(result.scalar() or 0)
-            db_query_latency_seconds.labels(query_type="senders_active_24h").observe(time.time() - start)
+            """)
+            if rows is not None:
+                messages_per_group.clear()
+                for row in rows:
+                    group_jid = row[0] or "unknown"
+                    group_name = row[1] or "unnamed"
+                    safe_name = group_name.replace('"', '').replace("'", "")[:50]
+                    messages_per_group.labels(group_jid=group_jid, group_name=safe_name).set(row[2] or 0)
 
             # Top 10 senders by message count
-            start = time.time()
-            # Clear previous values
-            messages_per_sender._metrics.clear()
-            result = await session.execute(text("""
+            rows = await _query(session, "messages_per_sender", """
                 SELECT m.sender_jid, COALESCE(s.push_name, m.sender_jid) as sender_name, COUNT(*) as msg_count
                 FROM message m
                 LEFT JOIN sender s ON s.jid = m.sender_jid
                 GROUP BY m.sender_jid, s.push_name
                 ORDER BY msg_count DESC
                 LIMIT 10
-            """))
-            for row in result:
-                sender_jid = row[0] or "unknown"
-                sender_name = str(row[1] or "unknown").replace('"', '').replace("'", "")[:50]
-                msg_count = row[2] or 0
-                messages_per_sender.labels(sender_jid=sender_jid, sender_name=sender_name).set(msg_count)
-            db_query_latency_seconds.labels(query_type="messages_per_sender").observe(time.time() - start)
-
-            # Reactions
-            start = time.time()
-            try:
-                result = await session.execute(text("SELECT COUNT(*) FROM reaction"))
-                reactions_total.set(result.scalar() or 0)
-            except Exception:
-                reactions_total.set(0)
-            db_query_latency_seconds.labels(query_type="reactions_total").observe(time.time() - start)
-
-            # Opt-outs
-            start = time.time()
-            try:
-                result = await session.execute(text("SELECT COUNT(*) FROM optout"))
-                optouts_total.set(result.scalar() or 0)
-            except Exception:
-                optouts_total.set(0)
-            db_query_latency_seconds.labels(query_type="optouts_total").observe(time.time() - start)
-
-            # KB Topics
-            start = time.time()
-            try:
-                result = await session.execute(text("SELECT COUNT(*) FROM kbtopic"))
-                kb_topics_total.set(result.scalar() or 0)
-            except Exception:
-                kb_topics_total.set(0)
-            db_query_latency_seconds.labels(query_type="kb_topics_total").observe(time.time() - start)
+            """)
+            if rows is not None:
+                messages_per_sender.clear()
+                for row in rows:
+                    sender_jid = row[0] or "unknown"
+                    sender_name = str(row[1] or "unknown").replace('"', '').replace("'", "")[:50]
+                    messages_per_sender.labels(sender_jid=sender_jid, sender_name=sender_name).set(row[2] or 0)
 
             # Table row counts (for capacity planning)
-            tables = ["message", "sender", '"group"', "reaction", "optout"]
+            db_table_rows.clear()
+            tables = ["message", "sender", '"group"', "reaction", "opt_out", "kbtopic", "kb_topic_message"]
             for table in tables:
-                try:
-                    result = await session.execute(text(f"SELECT COUNT(*) FROM {table}"))
-                    count = result.scalar() or 0
-                    db_table_rows.labels(table_name=table.replace('"', '')).set(count)
-                except Exception:
-                    pass
+                label = table.replace('"', '')
+                rows = await _query(session, f"table_rows_{label}", f"SELECT COUNT(*) FROM {table}")
+                if rows is not None:
+                    db_table_rows.labels(table_name=label).set(rows[0][0] or 0)
 
     except Exception as e:
         db_connection_status.set(0)
