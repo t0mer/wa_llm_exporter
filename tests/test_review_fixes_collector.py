@@ -118,7 +118,7 @@ async def test_page_cap(monkeypatch):
 
     serve(monkeypatch, handler)
     await exporter.collect_whatsapp_metrics()
-    assert len(calls) == exporter.OPENWA_GROUPS_MAX_PAGES == 50
+    assert len(calls) == exporter.OPENWA_GROUPS_MAX_PAGES == 200
 
 
 # --- 5: phone parsing --------------------------------------------------------
@@ -186,3 +186,20 @@ def test_startup_logs_backend_not_key(monkeypatch, caplog):
         exporter.log_backend_choice()
     assert "openwa" in caplog.text
     assert KEY not in caplog.text
+
+
+async def test_unexpected_exception_resets_state(monkeypatch):
+    serve(monkeypatch, paged_server(ids(0, 4)))
+    await exporter.collect_whatsapp_metrics()
+    assert sample("whatsapp_session_status", {"status": "ready"}) == 1
+
+    async def explode():
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(exporter, "_collect_openwa", explode)
+    await exporter.collect_whatsapp_metrics()
+    assert sample("whatsapp_connection_status") == 0
+    assert sample("whatsapp_devices_total") == 0
+    assert sample("whatsapp_session_status", {"status": "ready"}) is None
+    assert math.isnan(sample("whatsapp_api_groups"))
+    assert sample("whatsapp_device_info", {"name": "", "device": ""}) == 1

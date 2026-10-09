@@ -270,7 +270,7 @@ KNOWN_MESSAGE_TYPES = frozenset({
 HTTP_TRANSPORT: httpx.AsyncBaseTransport | None = None
 
 OPENWA_GROUPS_PAGE_SIZE = 100
-OPENWA_GROUPS_MAX_PAGES = 50
+OPENWA_GROUPS_MAX_PAGES = 200
 
 
 def resolve_backend() -> str:
@@ -329,6 +329,8 @@ async def collect_whatsapp_metrics():
             await _collect_gowa()
     except Exception as e:  # defensive: a scrape must never fail on the API side
         whatsapp_connection_status.set(0)
+        whatsapp_devices_total.set(0)
+        _reset_openwa_state()
         scrape_errors_total.labels(error_type="whatsapp_connection_error").inc()
         logger.error(f"WhatsApp metrics collection failed: {type(e).__name__}")
 
