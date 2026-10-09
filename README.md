@@ -240,7 +240,7 @@ All metrics use the `whatsapp_` prefix.
 | `whatsapp_devices_total` | Gauge | none | OpenWA: `1` when the session endpoint answers, else `0`. gowa: devices returned by `/app/devices`. |
 | `whatsapp_connection_status` | Gauge | none | OpenWA: `1` when the session status is `ready`. gowa: `1` when `/app/devices` returns a device. `0` otherwise or on error. |
 | `whatsapp_session_status` | Gauge | `status` | OpenWA only. `1` for the current session status (`ready`, `qr`, ...); other labels are removed each scrape. |
-| `whatsapp_api_groups` | Gauge | none | Groups reported live by the WhatsApp API. Compare with `whatsapp_groups_total` to spot drift. |
+| `whatsapp_api_groups` | Gauge | none | Groups reported live by the WhatsApp API. `NaN` when the session is not ready or the listing failed. Compare with `whatsapp_groups_total` to spot drift. |
 | `whatsapp_device_info` | Info | `name`, `device` | OpenWA: `pushName` (if the API returns one) and the session phone as a JID. gowa: name and JID of the first device. |
 | `whatsapp_api_latency_seconds` | Histogram | `endpoint` | WhatsApp API response time. OpenWA endpoints: `/api/sessions/{id}`, `/api/sessions/{id}/groups`. gowa: `/app/devices`, `/user/my/groups`. Buckets: 0.01 to 10 s. |
 
@@ -255,8 +255,8 @@ All metrics use the `whatsapp_` prefix.
 | `whatsapp_messages_direct_total` | Gauge | none | Messages with no `group_jid` (direct/private). |
 | `whatsapp_messages_group_total` | Gauge | none | Messages with a `group_jid`. |
 | `whatsapp_messages_with_media_total` | Gauge | none | Messages with a `media_url` **or** a text starting with `[[Attached `. OpenWA messages no longer store `media_url`, and uncaptioned media has no text, so this is a lower bound for new messages. |
-| `whatsapp_messages_per_group` | Gauge | `group_jid`, `group_name` | All-time message count for the top 50 groups. `group_name` is the admin `display_name`, else `group_name`, else the JID (quotes removed, cut to 50 characters). Reset every scrape. |
-| `whatsapp_messages_by_type` | Gauge | `message_type` | Messages grouped by the `[[Attached X]]` text prefix (`image`, `video`, `audio`, `document`, `sticker`, ...); everything else is `text`. Reset every scrape. |
+| `whatsapp_messages_per_group` | Gauge | `group_jid`, `group_name` | All-time message count for the top 50 groups. `group_name` is the admin `display_name` (if the column exists), else a non-empty `group_name`, else the JID (quotes removed, cut to 50 characters). Reset every scrape. |
+| `whatsapp_messages_by_type` | Gauge | `message_type` | Messages grouped by the `[[Attached X]]` text prefix (`image`, `video`, `audio`, `voice`, `document`, `sticker`, `gif`, `contact`, `location`, `poll`, `list`, `order`); no prefix is `text`; unknown prefixes are bucketed as `other` (the text is user-controlled). Reset every scrape. |
 
 ### Groups
 
