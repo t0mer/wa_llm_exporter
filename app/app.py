@@ -564,7 +564,7 @@ async def collect_database_metrics():
                  "SELECT COUNT(*) FROM sender WHERE jid <> ALL(CAST(:bots AS text[]))", bots),
                 ("senders_active_24h", senders_active_24h,
                  "SELECT COUNT(DISTINCT sender_jid) FROM message WHERE timestamp >= :ts "
-                 "AND sender_jid <> ALL(CAST(:bots AS text[]))",
+                 "AND COALESCE(sender_jid, '') <> ALL(CAST(:bots AS text[]))",
                  {"ts": last_24h, **bots}),
                 ("reactions_total", reactions_total, "SELECT COUNT(*) FROM reaction", None),
                 ("optouts_total", optouts_total, "SELECT COUNT(*) FROM opt_out", None),
@@ -573,17 +573,30 @@ async def collect_database_metrics():
             for name, gauge, sql, params in scalars:
                 await _scalar_into(session, name, gauge, sql, params)
 
-            # Messages per group (top 50)
-            rows = await _query(session, "messages_per_group", """
+            # Messages per group (top 50). display_name is missing on original wa_llm schemas,
+            # so fall back to a query without it.
+            group_sql = """
                 SELECT g.group_jid,
-                       COALESCE(NULLIF(g.display_name, ''), g.group_name, g.group_jid) AS label,
+                       COALESCE({label}) AS label,
                        COUNT(m.message_id) as msg_count
                 FROM "group" g
                 LEFT JOIN message m ON m.group_jid = g.group_jid
-                GROUP BY g.group_jid, g.display_name, g.group_name
+                GROUP BY g.group_jid{extra}, g.group_name
                 ORDER BY msg_count DESC
                 LIMIT 50
-            """)
+            """
+            rows = await _query(
+                session, "messages_per_group",
+                group_sql.format(
+                    label="NULLIF(g.display_name, ''), NULLIF(g.group_name, ''), g.group_jid",
+                    extra=", g.display_name",
+                ),
+            )
+            if rows is None:
+                rows = await _query(
+                    session, "messages_per_group_no_display_name",
+                    group_sql.format(label="NULLIF(g.group_name, ''), g.group_jid", extra=""),
+                )
             if rows is not None:
                 messages_per_group.clear()
                 for row in rows:
@@ -599,7 +612,7 @@ async def collect_database_metrics():
                        COUNT(*) as msg_count
                 FROM message m
                 LEFT JOIN sender s ON s.jid = m.sender_jid
-                WHERE m.sender_jid <> ALL(CAST(:bots AS text[]))
+                WHERE COALESCE(m.sender_jid, '') <> ALL(CAST(:bots AS text[]))
                 GROUP BY m.sender_jid, s.push_name
                 ORDER BY msg_count DESC
                 LIMIT 10
@@ -635,8 +648,12 @@ async def collect_database_metrics():
             """)
             if rows is not None:
                 messages_by_type.clear()
+                buckets: dict[str, int] = {}
                 for row in rows:
-                    messages_by_type.labels(message_type=row[0]).set(row[1] or 0)
+                    kind = row[0] if row[0] in KNOWN_MESSAGE_TYPES else "other"
+                    buckets[kind] = buckets.get(kind, 0) + (row[1] or 0)
+                for kind, count in buckets.items():
+                    messages_by_type.labels(message_type=kind).set(count)
 
             # Table row counts (for capacity planning)
             db_table_rows.clear()
@@ -714,6 +731,7 @@ async def lifespan(app: Starlette):
     """Application lifespan handler."""
     await init_db()
     logger.info(f"WhatsApp Prometheus Exporter started on port {PORT}")
+    log_backend_choice()
     logger.info("Metrics are collected on-demand when /metrics is called")
     yield
 
