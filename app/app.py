@@ -48,6 +48,15 @@ WHATSAPP_HOST = os.getenv("WHATSAPP_HOST") or (
 )
 WHATSAPP_BASIC_AUTH_USER = os.getenv("WHATSAPP_BASIC_AUTH_USER", "admin")
 WHATSAPP_BASIC_AUTH_PASSWORD = os.getenv("WHATSAPP_BASIC_AUTH_PASSWORD", "admin")
+
+
+def parse_jid_list(raw: str) -> list[str]:
+    """Parse a comma separated JID list, dropping blanks."""
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+
+# JIDs (phone and/or lid form) of the bot itself; excluded from sender metrics.
+BOT_JIDS = parse_jid_list(os.getenv("BOT_JIDS", ""))
 PORT = 9100
 
 # ============================================================================
@@ -153,7 +162,12 @@ senders_active_24h = Gauge(
 messages_per_sender = Gauge(
     "whatsapp_messages_per_sender",
     "Number of messages per sender (top 10)",
-    ["sender_jid", "sender_name"]
+    ["sender_jid", "sender_name", "jid_kind"]
+)
+senders_by_kind = Gauge(
+    "whatsapp_senders_by_kind",
+    "Number of known senders by JID kind (phone or lid), excluding the bot",
+    ["kind"]
 )
 
 # Reaction Metrics
@@ -464,6 +478,7 @@ async def collect_database_metrics():
             last_24h = now - timedelta(hours=24)
             last_hour = now - timedelta(hours=1)
 
+            bots = {"bots": list(BOT_JIDS)}
             scalars = [
                 ("messages_total", messages_total, "SELECT COUNT(*) FROM message", None),
                 ("messages_today", messages_today,
@@ -486,10 +501,12 @@ async def collect_database_metrics():
                  'SELECT COUNT(*) FROM "group" WHERE notify_on_spam = true', None),
                 ("groups_community", groups_with_community,
                  'SELECT COUNT(*) FROM "group" WHERE community_keys IS NOT NULL', None),
-                ("senders_total", senders_total, "SELECT COUNT(*) FROM sender", None),
+                ("senders_total", senders_total,
+                 "SELECT COUNT(*) FROM sender WHERE jid <> ALL(CAST(:bots AS text[]))", bots),
                 ("senders_active_24h", senders_active_24h,
-                 "SELECT COUNT(DISTINCT sender_jid) FROM message WHERE timestamp >= :ts",
-                 {"ts": last_24h}),
+                 "SELECT COUNT(DISTINCT sender_jid) FROM message WHERE timestamp >= :ts "
+                 "AND sender_jid <> ALL(CAST(:bots AS text[]))",
+                 {"ts": last_24h, **bots}),
                 ("reactions_total", reactions_total, "SELECT COUNT(*) FROM reaction", None),
                 ("optouts_total", optouts_total, "SELECT COUNT(*) FROM opt_out", None),
                 ("kb_topics_total", kb_topics_total, "SELECT COUNT(*) FROM kbtopic", None),
@@ -499,10 +516,12 @@ async def collect_database_metrics():
 
             # Messages per group (top 50)
             rows = await _query(session, "messages_per_group", """
-                SELECT g.group_jid, g.group_name, COUNT(m.message_id) as msg_count
+                SELECT g.group_jid,
+                       COALESCE(NULLIF(g.display_name, ''), g.group_name, g.group_jid) AS label,
+                       COUNT(m.message_id) as msg_count
                 FROM "group" g
                 LEFT JOIN message m ON m.group_jid = g.group_jid
-                GROUP BY g.group_jid, g.group_name
+                GROUP BY g.group_jid, g.display_name, g.group_name
                 ORDER BY msg_count DESC
                 LIMIT 50
             """)
@@ -514,21 +533,39 @@ async def collect_database_metrics():
                     safe_name = group_name.replace('"', '').replace("'", "")[:50]
                     messages_per_group.labels(group_jid=group_jid, group_name=safe_name).set(row[2] or 0)
 
-            # Top 10 senders by message count
+            # Top 10 senders by message count (bot excluded, JID kind labelled)
             rows = await _query(session, "messages_per_sender", """
-                SELECT m.sender_jid, COALESCE(s.push_name, m.sender_jid) as sender_name, COUNT(*) as msg_count
+                SELECT m.sender_jid, COALESCE(s.push_name, m.sender_jid) as sender_name,
+                       CASE WHEN m.sender_jid LIKE '%@lid' THEN 'lid' ELSE 'phone' END AS jid_kind,
+                       COUNT(*) as msg_count
                 FROM message m
                 LEFT JOIN sender s ON s.jid = m.sender_jid
+                WHERE m.sender_jid <> ALL(CAST(:bots AS text[]))
                 GROUP BY m.sender_jid, s.push_name
                 ORDER BY msg_count DESC
                 LIMIT 10
-            """)
+            """, bots)
             if rows is not None:
                 messages_per_sender.clear()
                 for row in rows:
                     sender_jid = row[0] or "unknown"
                     sender_name = str(row[1] or "unknown").replace('"', '').replace("'", "")[:50]
-                    messages_per_sender.labels(sender_jid=sender_jid, sender_name=sender_name).set(row[2] or 0)
+                    messages_per_sender.labels(
+                        sender_jid=sender_jid, sender_name=sender_name, jid_kind=row[2]
+                    ).set(row[3] or 0)
+
+            # Known senders split by JID kind (lid vs phone), bot excluded
+            rows = await _query(session, "senders_by_kind", """
+                SELECT CASE WHEN jid LIKE '%@lid' THEN 'lid' ELSE 'phone' END, COUNT(*)
+                FROM sender
+                WHERE jid <> ALL(CAST(:bots AS text[]))
+                GROUP BY 1
+            """, bots)
+            if rows is not None:
+                senders_by_kind.clear()
+                found = {row[0]: row[1] for row in rows}
+                for kind in ("phone", "lid"):
+                    senders_by_kind.labels(kind=kind).set(found.get(kind, 0))
 
             # Messages by type, from the "[[Attached X]]" text prefix (others are "text")
             rows = await _query(session, "messages_by_type", r"""
