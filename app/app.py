@@ -477,7 +477,8 @@ async def collect_database_metrics():
                 ("messages_group", messages_group_total,
                  "SELECT COUNT(*) FROM message WHERE group_jid IS NOT NULL", None),
                 ("messages_with_media", messages_with_media,
-                 "SELECT COUNT(*) FROM message WHERE media_url IS NOT NULL", None),
+                 "SELECT COUNT(*) FROM message "
+                 "WHERE media_url IS NOT NULL OR text LIKE '[[Attached %'", None),
                 ("groups_total", groups_total, 'SELECT COUNT(*) FROM "group"', None),
                 ("groups_managed", groups_managed,
                  'SELECT COUNT(*) FROM "group" WHERE managed = true', None),
@@ -528,6 +529,18 @@ async def collect_database_metrics():
                     sender_jid = row[0] or "unknown"
                     sender_name = str(row[1] or "unknown").replace('"', '').replace("'", "")[:50]
                     messages_per_sender.labels(sender_jid=sender_jid, sender_name=sender_name).set(row[2] or 0)
+
+            # Messages by type, from the "[[Attached X]]" text prefix (others are "text")
+            rows = await _query(session, "messages_by_type", r"""
+                SELECT COALESCE(LOWER(substring(text from '^\[\[Attached (\w+)\]\]')), 'text') AS t,
+                       COUNT(*)
+                FROM message
+                GROUP BY 1
+            """)
+            if rows is not None:
+                messages_by_type.clear()
+                for row in rows:
+                    messages_by_type.labels(message_type=row[0]).set(row[1] or 0)
 
             # Table row counts (for capacity planning)
             db_table_rows.clear()
